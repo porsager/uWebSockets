@@ -20,6 +20,13 @@
 
 /* An HttpResponse is the channel on which you send back a response */
 
+#ifdef __linux__
+#include <sys/sendfile.h>
+#ifdef UWS_WITH_OPENSSL
+#include <openssl/ssl.h>
+#endif
+#endif
+
 #include "AsyncSocket.h"
 #include "HttpResponseData.h"
 #include "HttpContext.h"
@@ -504,7 +511,7 @@ public:
             Super::cork();
             handler();
 
-            /* The only way we could possibly have changed the corked socket during handler call, would be if 
+            /* The only way we could possibly have changed the corked socket during handler call, would be if
              * the HTTP socket was upgraded to WebSocket and caused a realloc. Because of this we cannot use "this"
              * from here downwards. The corking is done with corkUnchecked() in upgrade. It steals cork. */
             auto *newCorkedSocket = loopData->corkedSocket;
@@ -575,6 +582,146 @@ public:
         /* Always reset this counter here */
         data->received_bytes_per_timeout = 0;
     }
+
+    bool sendFile(std::string_view path_view, std::string_view rangeHeader = {}) {
+        std::string path(path_view);
+
+        char resolved[PATH_MAX];
+        if (!realpath(path.c_str(), resolved)) return false;
+        path = resolved;
+
+        int fd = open(path.c_str(), O_RDONLY);
+        std::ifstream fallback;
+        bool useSendfile = false;
+#ifdef __linux__
+        useSendfile = (fd >= 0);
+#endif
+        if (!useSendfile) {
+            fallback.open(path, std::ios::binary);
+            if (!fallback.is_open()) {
+                if (fd >= 0) close(fd);
+                return false;
+            }
+        } else if (fd < 0) {
+            return false;
+        }
+
+        struct stat st;
+        off_t size = 0;
+        if (useSendfile) {
+            if (fstat(fd, &st) < 0) {
+                close(fd);
+                return false;
+            }
+            size = st.st_size;
+        } else {
+            fallback.seekg(0, std::ios::end);
+            size = fallback.tellg();
+            fallback.seekg(0, std::ios::beg);
+        }
+
+        off_t start = 0, end = size - 1;
+        bool ranged = false;
+        if (!rangeHeader.empty() && rangeHeader.find("bytes=") == 0) {
+            std::string r(rangeHeader.substr(6));
+            size_t dash = r.find('-');
+            if (dash != std::string::npos) {
+                std::string s = r.substr(0, dash), e = r.substr(dash + 1);
+                if (!s.empty()) start = std::stoll(s);
+                if (!e.empty()) end = std::stoll(e);
+                ranged = true;
+            }
+        }
+
+        if (ranged) {
+            if (start >= size || start > end) {
+                writeStatus("416 Range Not Satisfiable");
+                writeHeader("Content-Range", "bytes */" + std::to_string(size));
+                if (useSendfile) close(fd);
+                endWithoutBody();
+                return true;
+            }
+            if (end >= size) end = size - 1;
+            writeStatus("206 Partial Content");
+            writeHeader("Content-Range", "bytes " + std::to_string(start) + "-" + std::to_string(end) + "/" + std::to_string(size));
+        } else {
+            writeStatus("200 OK");
+        }
+
+        off_t len = end - start + 1;
+        writeHeader("Content-Length", std::to_string(len));
+        writeHeader("Accept-Ranges", "bytes");
+
+        cork([](){});
+
+        struct State {
+            int fd = -1;
+            std::ifstream file;
+            off_t offset;
+            off_t remaining;
+            bool useSendfile;
+            char buf[65536];
+        };
+        auto state = std::make_unique<State>();
+        state->offset = start;
+        state->remaining = len;
+        state->useSendfile = useSendfile;
+        if (useSendfile) {
+            state->fd = fd;
+        } else {
+            state->file = std::move(fallback);
+            state->file.seekg(start);
+        }
+
+        onWritable([this, s = std::move(state)](int bytes) mutable -> int {
+            if (s->remaining <= 0) return 0;
+
+            ssize_t sent = 0;
+#ifdef __linux__
+            if (s->useSendfile) {
+                off_t off = s->offset;
+                if constexpr (SSL) {
+#ifdef UWS_WITH_OPENSSL
+                    sent = SSL_sendfile(us_openssl_socket_ssl((us_openssl_socket_t *) this), s->fd, off, std::min(s->remaining, (off_t) bytes), 0);
+#endif
+                } else {
+                    int sockFd = us_socket_fd(false, (us_socket_t *) this);
+                    sent = sendfile(sockFd, s->fd, &off, std::min(s->remaining, (off_t) bytes));
+                }
+                if (sent > 0) s->offset = off;
+            } else
+#endif
+            {
+                off_t toRead = std::min(s->remaining, (off_t) sizeof(s->buf));
+                s->file.read(s->buf, toRead);
+                ssize_t read = s->file.gcount();
+                if (read > 0) {
+                    sent = write(std::string_view(s->buf, (size_t) read));
+                } else {
+                    sent = -1;
+                }
+            }
+
+            if (sent > 0) {
+                s->remaining -= sent;
+                s->offset += sent;
+                if (s->remaining <= 0) {
+                    if (s->useSendfile && s->fd >= 0) close(s->fd);
+                    endWithoutBody();
+                    return (int) sent;
+                }
+                return (int) sent;
+            } else if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                if (s->useSendfile && s->fd >= 0) close(s->fd);
+                close();
+                return 0;
+            }
+            return 0;
+        });
+
+        return true;
+    }
+
 };
 
 }
