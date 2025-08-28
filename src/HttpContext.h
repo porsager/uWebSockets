@@ -41,10 +41,10 @@ private:
     HttpContext() = delete;
 
     /* Maximum delay allowed until an HTTP connection is terminated due to outstanding request or rejected data (slow loris protection) */
-    static const int HTTP_IDLE_TIMEOUT_S = 10;
+    static const int HTTP_IDLE_TIMEOUT_S = 60;
 
     /* Minimum allowed receive throughput per second (clients uploading less than 16kB/sec get dropped) */
-    static const int HTTP_RECEIVE_THROUGHPUT_BYTES = 16 * 1024;
+    static const int HTTP_RECEIVE_THROUGHPUT_BYTES = 1024;
 
     us_loop_t *getLoop() {
         return us_socket_context_loop(SSL, getSocketContext());
